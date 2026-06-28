@@ -35,11 +35,12 @@
   luajit,
   swig,
   python3,
+  python311,
   alsaSupport ? stdenv.hostPlatform.isLinux,
   alsa-lib,
   pulseaudioSupport ? config.pulseaudio or stdenv.hostPlatform.isLinux,
   libpulseaudio,
-  browserSupport ? true,
+  browserSupport ? stdenv.hostPlatform.isLinux,
   cef-binary,
   pciutils,
   pipewireSupport ? stdenv.hostPlatform.isLinux,
@@ -57,12 +58,15 @@
   asio,
   decklinkSupport ? false,
   blackmagic-desktop-video,
+  freetype,
   libdatachannel,
   libvpl,
   qrcodegencpp,
+  rnnoise,
   simde,
   nix-update-script,
   kdePackages,
+  swift,
 }:
 
 let
@@ -115,14 +119,17 @@ stdenv.mkDerivation (finalAttrs: {
   ];
 
   nativeBuildInputs = [
-    addDriverRunpath
     cmake
     ninja
     pkg-config
-    wrapGAppsHook3
     wrapQtAppsHook
     kdePackages.extra-cmake-modules
   ]
+  ++ optionals stdenv.hostPlatform.isLinux [
+    addDriverRunpath
+    wrapGAppsHook3
+  ]
+  ++ optional stdenv.hostPlatform.isDarwin swift
   ++ optional scriptingSupport swig
   ++ optional cudaSupport autoAddDriverRunpath;
 
@@ -131,35 +138,41 @@ stdenv.mkDerivation (finalAttrs: {
     ffmpeg
     jansson
     libjack2
-    libv4l
-    libxkbcommon
-    libpthread-stubs
-    libxdmcp
     qtbase
     qtsvg
     speex
-    wayland
     x264
-    libvlc
     mbedtls
-    pciutils
     librist
     cjson
-    libva
     srt
-    qtwayland
     nlohmann_json
     websocketpp
     asio
     libdatachannel
-    libvpl
     qrcodegencpp
     uthash
+  ]
+  ++ optionals stdenv.hostPlatform.isDarwin [
+    freetype
+    rnnoise
+  ]
+  ++ optionals stdenv.hostPlatform.isLinux [
+    libv4l
+    libvlc
+    libxkbcommon
+    libpthread-stubs
+    libxdmcp
+    wayland
+    pciutils
+    libva
+    qtwayland
+    libvpl
     nv-codec-headers-12
   ]
   ++ optionals scriptingSupport [
     luajit
-    python3
+    (if stdenv.hostPlatform.isDarwin then python311 else python3)
   ]
   ++ optional alsaSupport alsa-lib
   ++ optional pulseaudioSupport libpulseaudio
@@ -177,9 +190,32 @@ stdenv.mkDerivation (finalAttrs: {
     ln -s ${cef} cef
   '';
 
-  postPatch = ''
-    cp ${./CMakeUserPresets.json} ./CMakeUserPresets.json
-  '';
+  postPatch =
+    ''
+      cp ${./CMakeUserPresets.json} ./CMakeUserPresets.json
+    ''
+    + lib.optionalString stdenv.hostPlatform.isDarwin ''
+      # Remove Xcode generator requirement and xcrun-based SDK checks
+      sed -i '/^if(NOT XCODE)/,/^endif()/d' cmake/macos/compilerconfig.cmake
+      sed -i '/^check_sdk_requirements()/d' cmake/macos/compilerconfig.cmake
+      # Remove download of pre-built obs-deps (Nix provides all deps via buildInputs)
+      sed -i '/^include(buildspec)/d' cmake/macos/defaults.cmake
+      # Remove -py3-stable-abi swig flag (not supported in nixpkgs swig)
+      sed -i 's/-py3-stable-abi//' shared/obs-scripting/cmake/python.cmake
+      sed -i 's/-py3-stable-abi//' shared/obs-scripting/obspython/CMakeLists.txt
+      # Swift module name cannot contain hyphens (Xcode handles this automatically)
+      sed -i '/^add_library(libobs-metal SHARED)/a set_target_properties(libobs-metal PROPERTIES Swift_MODULE_NAME libobs_metal)' libobs-metal/CMakeLists.txt
+      # Explicitly pass bridging header to swiftc (Xcode uses SWIFT_OBJC_BRIDGING_HEADER attribute instead)
+      echo 'target_compile_options(libobs-metal PRIVATE "$<$<COMPILE_LANGUAGE:Swift>:-import-objc-header;''${CMAKE_CURRENT_SOURCE_DIR}/libobs-metal-Bridging-Header.h>")' >> libobs-metal/CMakeLists.txt
+      # Enable Swift language for Ninja (Xcode enables it implicitly)
+      substituteInPlace CMakeLists.txt \
+        --replace-fail \
+        'project(obs-studio VERSION ''${OBS_VERSION_CANONICAL})' \
+        'project(obs-studio VERSION ''${OBS_VERSION_CANONICAL})
+if(APPLE)
+  enable_language(Swift)
+endif()'
+    '';
 
   cmakeFlags = [
     "--preset"
@@ -196,16 +232,23 @@ stdenv.mkDerivation (finalAttrs: {
     (lib.cmakeBool "ENABLE_PIPEWIRE" pipewireSupport)
     (lib.cmakeBool "ENABLE_AJA" false) # TODO: fix linking against libajantv2
     (lib.cmakeBool "ENABLE_BROWSER" browserSupport)
+    (lib.cmakeBool "ENABLE_VLC" stdenv.hostPlatform.isLinux)
+    (lib.cmakeBool "ENABLE_VIRTUALCAM" false)
+  ]
+  ++ lib.optionals stdenv.hostPlatform.isDarwin [
+    "-DCMAKE_Swift_COMPILER=swiftc"
   ]
   ++ lib.optional browserSupport "-DCEF_ROOT_DIR=../../cef";
 
-  env.NIX_CFLAGS_COMPILE = toString [
-    "-Wno-error=deprecated-declarations"
-    "-Wno-error=sign-compare" # https://github.com/obsproject/obs-studio/issues/10200
-    "-Wno-error=stringop-overflow="
-  ];
+  env.NIX_CFLAGS_COMPILE = toString (
+    [
+      "-Wno-error=deprecated-declarations"
+      "-Wno-error=sign-compare" # https://github.com/obsproject/obs-studio/issues/10200
+    ]
+    ++ lib.optional stdenv.hostPlatform.isLinux "-Wno-error=stringop-overflow="
+  );
 
-  dontWrapGApps = true;
+  dontWrapGApps = stdenv.hostPlatform.isLinux;
   preFixup =
     let
       wrapperLibraries = [
@@ -215,7 +258,7 @@ stdenv.mkDerivation (finalAttrs: {
       ]
       ++ optionals decklinkSupport [ blackmagic-desktop-video ];
     in
-    ''
+    lib.optionalString stdenv.hostPlatform.isLinux ''
       qtWrapperArgs+=(
         --prefix LD_LIBRARY_PATH : "$out/lib:${lib.makeLibraryPath wrapperLibraries}"
         ''${gappsWrapperArgs[@]}
@@ -232,7 +275,7 @@ stdenv.mkDerivation (finalAttrs: {
     '';
 
   postFixup = lib.concatStrings [
-    (lib.optionalString stdenv.hostPlatform.isLinux ''
+    (lib.optionalString (stdenv.hostPlatform.isLinux && !cudaSupport) ''
       addDriverRunpath $out/lib/lib*.so
       addDriverRunpath $out/lib/obs-plugins/*.so
     '')
@@ -254,6 +297,7 @@ stdenv.mkDerivation (finalAttrs: {
     '';
     homepage = "https://obsproject.com";
     maintainers = with lib.maintainers; [
+      damidoug
       jb55
       materus
       fpletz
@@ -263,6 +307,8 @@ stdenv.mkDerivation (finalAttrs: {
       "x86_64-linux"
       "i686-linux"
       "aarch64-linux"
+      "x86_64-darwin"
+      "aarch64-darwin"
     ];
     mainProgram = "obs";
   };
